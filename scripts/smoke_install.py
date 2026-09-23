@@ -86,7 +86,7 @@ def main() -> int:
         valid = all(
             (
                 checks["installer_ok"],
-                checks["version"] == "0.1.0",
+                checks["version"] == "0.1.1",
                 checks["health_status"] == "degraded",
                 isinstance(checks["health_records_checked"], int) and checks["health_records_checked"] > 0,
                 checks["skill_valid"],

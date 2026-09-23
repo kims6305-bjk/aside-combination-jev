@@ -70,6 +70,18 @@ Receipt record는 key가 정렬되고 불필요한 공백이 없으며 비ASCII 
 
 검증은 기록된 byte의 일관성과 강제된 event 순서를 증명합니다. 어댑터가 외부 상태를 정확히 관찰했다는 사실은 증명하지 않습니다.
 
+## 실제 브라우저 예제
+
+`examples/playwright_live.py`는 `127.0.0.1`에서 띄운 페이지를 대상으로 headless Chromium을 하네스를 거쳐 조작한다. 계정이나 외부 네트워크는 쓰지 않는다. 하네스가 보고한 결과가 아니라 페이지 DOM을 직접 읽어 네 가지를 확인한다: 되돌릴 수 있는 클릭은 완료되고, dry run은 페이지를 바꾸지 않고, 민감한 submit은 클릭 없이 `NEEDS_HUMAN`에서 멈추고, 페이지에 카드번호 형태의 숫자가 있으면 행동 전에 거부된다.
+
+```sh
+python -m pip install playwright
+python -m playwright install chromium
+python examples/playwright_live.py   # LIVE PASS 4/4 출력
+```
+
+예제의 판단 adapter는 모델이 아니라 결정적 규칙이다.
+
 ## 보안 모델과 제약
 
 - 기본 상태에는 어댑터가 없으므로 동작할 수 없습니다.

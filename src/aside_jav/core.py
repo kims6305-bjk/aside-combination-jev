@@ -518,7 +518,7 @@ def check_health(receipt_dir: str | os.PathLike[str] | None = None, browser: Bro
     except Exception:
         components["receipt_store"] = {"ok": False}
         components["offline_verifier"] = {"ok": False, "valid_records_checked": 0}
-    components["package"] = {"ok": True, "version": "0.1.0"}
+    components["package"] = {"ok": True, "version": "0.1.1"}
     components["policy"] = {"ok": True, "default": "fail_closed"}
     components["browser_adapter"] = {"ok": browser is not None, "mode": "configured" if browser else "not_configured"}
     components["jev_adapter"] = {"ok": judgment is not None, "mode": "configured" if judgment else "not_configured"}
