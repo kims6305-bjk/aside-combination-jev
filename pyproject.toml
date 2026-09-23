@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aside-combination-jev"
+version = "0.1.0"
+description = "Policy-gated browser action harness with verifiable receipts"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Clean-room contributors"}]
+dependencies = []
+
+[project.scripts]
+aside-jav = "aside_jav.cli:main"
+aside-jav-mcp = "aside_jav.mcp:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
