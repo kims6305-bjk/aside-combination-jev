@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Protocol
 
-from .receipts import GENESIS, ReceiptLedger, ReceiptWriteError, contains_secret, fingerprint, verify_receipts
+from .receipts import INTERNAL_HASH_FIELDS, GENESIS, ReceiptLedger, ReceiptWriteError, contains_secret, fingerprint, verify_receipts
 
 ERROR_RETRYABLE = {
     "AJV_E_REQUEST_INVALID": False,
@@ -134,11 +134,12 @@ def _validate_request(request: Any) -> dict[str, Any]:
         raise ContractError("AJV_E_REQUEST_INVALID", "action policy fields must be arrays")
     if not isinstance(request["browser_context"], dict) or not isinstance(request["dry_run"], bool):
         raise ContractError("AJV_E_REQUEST_INVALID", "browser_context or dry_run has the wrong type")
-    if contains_secret(request.get("metadata", {})) or contains_secret(request["browser_context"]):
-        raise ContractError("AJV_E_SECRET_DETECTED", "request contains secret material")
     handles = request.get("secret_handles", {})
     if not isinstance(handles, dict) or any(not isinstance(value, str) or not _VAULT_HANDLE.fullmatch(value) for value in handles.values()):
         raise ContractError("AJV_E_SECRET_DETECTED", "secret_handles must contain references only")
+    untrusted_fields = {key: value for key, value in request.items() if key != "secret_handles"}
+    if contains_secret(untrusted_fields):
+        raise ContractError("AJV_E_SECRET_DETECTED", "request contains secret material")
     budgets = request["budgets"]
     needed = {"max_actions", "max_jev_calls", "max_elapsed_seconds", "max_paid_cost"}
     if not isinstance(budgets, dict) or not needed.issubset(budgets):
@@ -163,7 +164,7 @@ def _validate_candidates(raw: Any, observation: dict[str, Any]) -> list[dict[str
             raise ContractError("AJV_E_JEV_CONTRACT", "candidate contract is incomplete")
         if candidate["candidate_id"] in ids or candidate["source_fingerprint"] != observation["fingerprint"]:
             raise ContractError("AJV_E_OBSERVATION_STALE", "candidate is duplicate or stale")
-        if contains_secret(candidate):
+        if contains_secret(candidate, trusted_hash_fields=frozenset({"source_fingerprint"})):
             raise ContractError("AJV_E_SECRET_DETECTED", "candidate contains secret material")
         ids.add(candidate["candidate_id"])
         candidates.append(candidate)
@@ -176,10 +177,22 @@ def _validate_decision(raw: Any, candidates: list[dict[str, Any]], input_fingerp
     required = {"decision_id", "selected_candidate_id", "allow_recommendation", "confidence", "probabilities", "omitted_mass", "reason_codes", "model_id", "input_fingerprint"}
     if not isinstance(raw, dict) or not required.issubset(raw):
         raise ContractError("AJV_E_JEV_CONTRACT", "judgment contract is incomplete")
+    if (
+        not isinstance(raw["decision_id"], str)
+        or not raw["decision_id"]
+        or not isinstance(raw["allow_recommendation"], bool)
+        or not isinstance(raw["reason_codes"], list)
+        or not all(isinstance(code, str) for code in raw["reason_codes"])
+        or not isinstance(raw["model_id"], str)
+        or not raw["model_id"]
+        or not isinstance(raw["input_fingerprint"], str)
+        or (raw["selected_candidate_id"] is not None and not isinstance(raw["selected_candidate_id"], str))
+    ):
+        raise ContractError("AJV_E_JEV_CONTRACT", "judgment fields have invalid types")
     selected = raw["selected_candidate_id"]
     if selected is not None and selected not in {item["candidate_id"] for item in candidates}:
         raise ContractError("AJV_E_JEV_CONTRACT", "judgment selected an unknown candidate")
-    if raw["input_fingerprint"] != input_fingerprint or contains_secret(raw):
+    if raw["input_fingerprint"] != input_fingerprint or contains_secret(raw, trusted_hash_fields=frozenset({"input_fingerprint"})):
         raise ContractError("AJV_E_JEV_CONTRACT", "judgment input binding is invalid")
     numbers = [raw["confidence"], raw["omitted_mass"]]
     probabilities = raw["probabilities"]
@@ -237,6 +250,54 @@ def _existing_result(path: Path) -> dict[str, Any] | None:
     return None
 
 
+def _incomplete_receipt(path: Path, run_id: str) -> tuple[list[str], str] | None:
+    """Return verified events for a hash-valid receipt prefix without a terminal."""
+    events: list[str] = []
+    previous = GENESIS
+    try:
+        for expected_seq, line in enumerate(path.read_text(encoding="utf-8").splitlines()):
+            record = json.loads(line)
+            required = {"schema_version", "run_id", "seq", "event_type", "recorded_at", "payload", "prev_hash", "record_hash"}
+            supplied = record.get("record_hash") if isinstance(record, dict) else None
+            unhashed = dict(record)
+            unhashed.pop("record_hash", None)
+            if (
+                set(record) != required
+                or not isinstance(supplied, str)
+                or record["run_id"] != run_id
+                or record["seq"] != expected_seq
+                or record["prev_hash"] != previous
+                or fingerprint(unhashed) != supplied
+                or contains_secret(record["payload"], trusted_hash_fields=INTERNAL_HASH_FIELDS)
+                or record["event_type"] == "terminal_result"
+            ):
+                return None
+            previous = supplied
+            events.append(record["event_type"])
+    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+    return (events, previous) if events and events[0] in {"request_accepted", "request_rejected"} else None
+
+
+def _recovery_result(run_id: str, path: Path, events: list[str], head: str, after: str | None = None) -> dict[str, Any]:
+    return {
+        "run_id": run_id,
+        "status": "NEEDS_HUMAN",
+        "final_state": "NEEDS_HUMAN",
+        "error_code": "AJV_E_HUMAN_REQUIRED",
+        "retryable": False,
+        "message": "incomplete prior run requires human review",
+        "actions_attempted": events.count("action_attempted"),
+        "actions_confirmed": 0,
+        "completion": {"matched": False, "evidence": []},
+        "before_fingerprint": None,
+        "after_fingerprint": after,
+        "receipt_path": str(path),
+        "receipt_head": head,
+        "warnings": ["incomplete_run_not_reexecuted"],
+    }
+
+
 class Harness:
     def __init__(self, browser: BrowserAdapter, judgment: JudgmentAdapter, receipt_dir: str | os.PathLike[str]):
         self.browser = browser
@@ -248,25 +309,38 @@ class Harness:
         if not _RUN_ID.fullmatch(run_id):
             return _bare_error(run_id, "AJV_E_REQUEST_INVALID", "invalid run identifier")
         path = self.receipt_dir / f"{run_id}.jsonl"
+        try:
+            request = _validate_request(raw_request)
+        except ContractError as exc:
+            if path.exists():
+                return _bare_error(run_id, exc.code, "request rejected before existing run lookup", str(path))
+            try:
+                ledger = ReceiptLedger(path, run_id)
+                ledger.append("request_rejected", {"error_code": exc.code, "message": str(exc)})
+                return self._finish(ledger, run_id, "FAILED", "FAILED", exc.code, 0, 0, {"matched": False, "evidence": []}, None, None)
+            except (OSError, ReceiptWriteError):
+                return _bare_error(run_id, "AJV_E_RECEIPT_WRITE", "cannot persist rejected request", str(path))
         if path.exists():
             prior = _existing_result(path)
             if prior is not None:
                 prior["warnings"] = list(prior.get("warnings", [])) + ["run_id_reused_existing_result"]
                 return prior
+            incomplete = _incomplete_receipt(path, run_id)
+            if incomplete is not None:
+                events, head = incomplete
+                if "action_attempted" in events:
+                    try:
+                        after = _normalize_observation(self.browser.observe(request["browser_context"]))["fingerprint"]
+                    except Exception:
+                        after = None
+                    return _recovery_result(run_id, path, events, head, after)
+                if "intent_durable" in events:
+                    return _recovery_result(run_id, path, events, head)
             return _bare_error(run_id, "AJV_E_RECEIPT_CHAIN", "existing run receipt is incomplete or invalid", str(path))
         try:
             ledger = ReceiptLedger(path, run_id)
         except OSError:
             return _bare_error(run_id, "AJV_E_RECEIPT_WRITE", "cannot create receipt", str(path))
-        try:
-            request = _validate_request(raw_request)
-        except ContractError as exc:
-            try:
-                ledger.append("request_rejected", {"error_code": exc.code, "message": str(exc)})
-                return self._finish(ledger, run_id, "FAILED", "FAILED", exc.code, 0, 0, {"matched": False, "evidence": []}, None, None)
-            except ReceiptWriteError:
-                return _bare_error(run_id, "AJV_E_RECEIPT_WRITE", "cannot persist rejected request", str(path))
-
         started = time.monotonic()
         actions_attempted = actions_confirmed = jev_calls = 0
         before_fp: str | None = None
@@ -334,7 +408,8 @@ class Harness:
                     raise
                 except Exception as exc:
                     jev_calls += 1
-                    raise ContractError("AJV_E_JEV_UNAVAILABLE", "judgment adapter unavailable") from exc
+                    code = "AJV_E_PAID_RETRY_BLOCKED" if getattr(self.judgment, "paid", True) is not False else "AJV_E_JEV_UNAVAILABLE"
+                    raise ContractError(code, "judgment adapter unavailable; automatic paid retry is blocked") from exc
                 transition("JUDGED")
                 ledger.append("jev_decision_received", {"decision": decision})
                 selected_id = decision["selected_candidate_id"]
@@ -427,7 +502,9 @@ def check_health(receipt_dir: str | os.PathLike[str] | None = None, browser: Bro
         probe = directory / f"health-{os.getpid()}-{time.time_ns()}.jsonl"
         ledger = ReceiptLedger(probe, "health")
         ledger.append("request_accepted", {"health": True})
-        ledger.append("terminal_result", {"result": {"status": "ALREADY_COMPLETE"}})
+        completion = {"matched": True, "evidence": [], "fingerprint": fingerprint([])}
+        ledger.append("completion_verdict", {"completion": completion})
+        ledger.append("terminal_result", {"result": {"status": "ALREADY_COMPLETE", "completion": completion, "before_fingerprint": fingerprint({"health": True}), "after_fingerprint": None}})
         good = verify_receipts(probe)
         tampered = probe.read_bytes().replace(b'"health":true', b'"health":false', 1)
         bad_probe = probe.with_suffix(".tampered.jsonl")

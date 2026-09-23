@@ -9,9 +9,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from aside_jav import Harness, __version__, check_health, verify_receipts
+from aside_jav.cli import main as cli_main
 from aside_jav.core import evaluate_completion
 from aside_jav.mcp import TOOLS, dispatch
-from aside_jav.receipts import ReceiptLedger, ReceiptWriteError, fingerprint
+from aside_jav.receipts import INTERNAL_HASH_FIELDS, ReceiptLedger, ReceiptWriteError, contains_secret, fingerprint
 
 
 def observation(step: int = 0, *, facts=None, extra=None):
@@ -90,6 +91,19 @@ class FakeBrowser:
             raise RuntimeError("adapter contained Bearer abcdefghijklmnop")
         self.step += 1
         return {"accepted": True}
+
+
+class MissingRiskBrowser(FakeBrowser):
+    def enumerate_candidates(self, current, goal):
+        candidates = super().enumerate_candidates(current, goal)
+        del candidates[0]["risk_class"]
+        return candidates
+
+
+class FailingObserveBrowser(FakeBrowser):
+    def observe(self, context):
+        self.calls.append("observe")
+        raise RuntimeError("observation unavailable")
 
 
 class FakeJudgment:
@@ -235,8 +249,89 @@ class HarnessTests(unittest.TestCase):
     def test_paid_failure_is_not_retried_or_fallen_back(self):
         judge = FakeJudgment(fail=True)
         result, browser, _ = self.run_harness(judgment=judge)
-        self.assertEqual(result["error_code"], "AJV_E_JEV_UNAVAILABLE")
+        self.assertEqual(result["error_code"], "AJV_E_PAID_RETRY_BLOCKED")
         self.assertEqual(judge.calls, 1)
+        self.assertEqual(browser.actions, 0)
+
+    def test_entire_request_secret_boundary_precedes_adapters(self):
+        variants = [
+            {"goal": {"completion": [{"path": "facts.status", "op": "eq", "expected": "Bearer abcdefghijklmnop"}]}},
+            {"goal": {"completion": [{"path": "facts.status", "op": "eq", "expected": "done"}], "handle": "Bearer abcdefghijklmnop"}},
+            {"metadata": {"nested": {"handle": "Bearer abcdefghijklmnop"}}},
+        ]
+        for index, changes in enumerate(variants):
+            with self.subTest(changes=changes):
+                browser = FakeBrowser()
+                judgment = FakeJudgment()
+                result, _, _ = self.run_harness(req=request(f"secret-request-{index}", **changes), browser=browser, judgment=judgment)
+                self.assertEqual(result["error_code"], "AJV_E_SECRET_DETECTED")
+                self.assertEqual(browser.actions, 0)
+                self.assertEqual(browser.calls, [])
+                self.assertEqual(judgment.calls, 0)
+
+    def test_judgment_required_field_types_fail_closed(self):
+        variants = [
+            {"allow_recommendation": "yes"},
+            {"decision_id": 7},
+            {"reason_codes": "goal_progress"},
+            {"model_id": 9},
+        ]
+        for index, mutation in enumerate(variants):
+            with self.subTest(mutation=mutation):
+                result, browser, _ = self.run_harness(req=request(f"decision-type-{index}"), judgment=FakeJudgment(mutation))
+                self.assertEqual(result["error_code"], "AJV_E_JEV_CONTRACT")
+                self.assertEqual(browser.actions, 0)
+
+    def test_missing_risk_classification_is_not_executed(self):
+        result, browser, _ = self.run_harness(browser=MissingRiskBrowser())
+        self.assertEqual(result["status"], "NEEDS_HUMAN")
+        self.assertEqual(browser.actions, 0)
+
+    def test_decision_uncertainty_is_recorded(self):
+        result, _, _ = self.run_harness()
+        records = [json.loads(line) for line in Path(result["receipt_path"]).read_text().splitlines()]
+        decision = next(record["payload"]["decision"] for record in records if record["event_type"] == "jev_decision_received")
+        self.assertEqual(decision["confidence"], 0.9)
+        self.assertEqual(decision["probabilities"], {"success": 0.8, "failure": 0.1})
+        self.assertEqual(decision["omitted_mass"], 0.1)
+        self.assertEqual(decision["model_id"], "fake-model-1")
+        self.assertRegex(decision["input_fingerprint"], r"^[0-9a-f]{64}$")
+
+    def test_action_result_has_independent_before_after_evidence(self):
+        result, browser, _ = self.run_harness()
+        self.assertNotEqual(result["before_fingerprint"], result["after_fingerprint"])
+        self.assertEqual(browser.calls.count("observe"), 2)
+        self.assertEqual(result["actions_confirmed"], 1)
+
+    def test_failed_observation_is_bounded(self):
+        browser = FailingObserveBrowser()
+        result, _, _ = self.run_harness(browser=browser)
+        self.assertEqual(result["error_code"], "AJV_E_OBSERVE_FAILED")
+        self.assertEqual(browser.calls.count("observe"), 1)
+        self.assertEqual(browser.actions, 0)
+
+    def test_incomplete_intent_is_not_reexecuted(self):
+        path = Path(self.temp.name) / "recover-intent.jsonl"
+        ledger = ReceiptLedger(path, "recover-intent")
+        ledger.append("request_accepted", {"ok": True})
+        ledger.append("intent_durable", {"intent": {"candidate_fingerprint": "f" * 64}})
+        browser = FakeBrowser()
+        result, _, _ = self.run_harness(req=request("recover-intent"), browser=browser)
+        self.assertEqual(result["status"], "NEEDS_HUMAN")
+        self.assertEqual(result["error_code"], "AJV_E_HUMAN_REQUIRED")
+        self.assertEqual(browser.actions, 0)
+
+    def test_incomplete_action_reobserves_before_human_review(self):
+        path = Path(self.temp.name) / "recover-action.jsonl"
+        ledger = ReceiptLedger(path, "recover-action")
+        ledger.append("request_accepted", {"ok": True})
+        ledger.append("intent_durable", {"intent": {"candidate_fingerprint": "f" * 64}})
+        ledger.append("action_attempted", {"candidate_fingerprint": "f" * 64, "attempt": 1})
+        browser = FakeBrowser(done_after=2)
+        result, _, _ = self.run_harness(req=request("recover-action"), browser=browser)
+        self.assertEqual(browser.calls, ["observe"])
+        self.assertEqual(result["status"], "NEEDS_HUMAN")
+        self.assertEqual(result["actions_attempted"], 1)
         self.assertEqual(browser.actions, 0)
 
     def test_cost_budget_is_enforced(self):
@@ -255,6 +350,79 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(browser.actions, 0)
         good, _, _ = self.run_harness(req=request("handle-run", secret_handles={"login": "vault://example/login"}))
         self.assertEqual(good["status"], "COMPLETED")
+
+    def test_candidate_generic_handle_does_not_bypass_secret_detection(self):
+        class GenericHandleBrowser(FakeBrowser):
+            def enumerate_candidates(self, current, goal):
+                candidates = super().enumerate_candidates(current, goal)
+                candidates[0]["value"] = {"handle": "Bearer abcdefghijklmnop"}
+                return candidates
+
+        result, browser, judgment = self.run_harness(browser=GenericHandleBrowser())
+        self.assertEqual(result["error_code"], "AJV_E_SECRET_DETECTED")
+        self.assertEqual(browser.actions, 0)
+        self.assertEqual(judgment.calls, 0)
+
+    def test_verified_fingerprint_does_not_trigger_card_detection(self):
+        observed = "0cdc1b6a8e9dfa1dd409fd9220f1461600e46ac8e64898820573426de4b0db58"
+        self.assertTrue(contains_secret(observed))
+        self.assertFalse(contains_secret({"source_fingerprint": observed}, trusted_hash_fields=frozenset({"source_fingerprint"})))
+        with patch("aside_jav.core.fingerprint", return_value=observed), patch(
+            f"{__name__}.fingerprint", return_value=observed
+        ):
+            result, browser, _ = self.run_harness(req=request("fingerprint-negative-control"))
+        self.assertEqual(result["status"], "COMPLETED", result)
+        self.assertEqual(browser.actions, 1)
+        self.assertIn(observed, Path(result["receipt_path"]).read_text(encoding="utf-8"))
+
+    def test_raw_card_and_bearer_remain_blocked_at_every_boundary(self):
+        secrets = ("4111111111111111", "Bearer abcdefghijklmnop")
+        for index, secret in enumerate(secrets):
+            with self.subTest(secret_type=index):
+                self.assertTrue(contains_secret({"value": secret}, trusted_hash_fields=INTERNAL_HASH_FIELDS))
+
+                request_result, request_browser, _ = self.run_harness(
+                    req=request(f"raw-request-{index}", metadata={"value": secret})
+                )
+                self.assertEqual(request_result["error_code"], "AJV_E_SECRET_DETECTED")
+                self.assertEqual(request_browser.calls, [])
+
+                class SecretObservationBrowser(FakeBrowser):
+                    def observe(self, context):
+                        value = super().observe(context)
+                        value["facts"]["value"] = secret
+                        return value
+
+                observation_result, observation_browser, _ = self.run_harness(
+                    req=request(f"raw-observation-{index}"), browser=SecretObservationBrowser()
+                )
+                self.assertEqual(observation_result["error_code"], "AJV_E_SECRET_DETECTED")
+                self.assertEqual(observation_browser.actions, 0)
+
+                class SecretCandidateBrowser(FakeBrowser):
+                    def enumerate_candidates(self, current, goal):
+                        candidates = super().enumerate_candidates(current, goal)
+                        candidates[0]["value"] = secret
+                        return candidates
+
+                candidate_result, candidate_browser, _ = self.run_harness(
+                    req=request(f"raw-candidate-{index}"), browser=SecretCandidateBrowser()
+                )
+                self.assertEqual(candidate_result["error_code"], "AJV_E_SECRET_DETECTED")
+                self.assertEqual(candidate_browser.actions, 0)
+
+                decision_result, decision_browser, _ = self.run_harness(
+                    req=request(f"raw-decision-{index}"), judgment=FakeJudgment({"reason_codes": [secret]})
+                )
+                self.assertEqual(decision_result["error_code"], "AJV_E_JEV_CONTRACT")
+                self.assertEqual(decision_browser.actions, 0)
+
+                receipt = Path(self.temp.name) / f"raw-receipt-{index}.jsonl"
+                ledger = ReceiptLedger(receipt, f"raw-receipt-{index}")
+                ledger.append("request_rejected", {"value": secret})
+                ledger.append("terminal_result", {"result": {"status": "FAILED"}})
+                self.assertNotIn(secret, receipt.read_text(encoding="utf-8"))
+                self.assertTrue(verify_receipts(receipt)["valid"])
 
     def test_run_id_is_idempotent(self):
         first, browser, judgment = self.run_harness()
@@ -294,7 +462,9 @@ class ReceiptTests(unittest.TestCase):
         path = Path(self.temp.name) / name
         ledger = ReceiptLedger(path, "r")
         ledger.append("request_accepted", {"ok": True})
-        ledger.append("terminal_result", {"result": {"status": "ALREADY_COMPLETE"}})
+        completion = {"matched": True, "evidence": []}
+        ledger.append("completion_verdict", {"completion": completion})
+        ledger.append("terminal_result", {"result": {"status": "ALREADY_COMPLETE", "completion": completion, "before_fingerprint": "a" * 64, "after_fingerprint": None}})
         return path
 
     def test_valid_chain_nonempty(self):
@@ -329,6 +499,36 @@ class ReceiptTests(unittest.TestCase):
                 path.write_text("\n".join(changed) + "\n")
                 self.assertFalse(verify_receipts(path)["valid"])
 
+    def test_record_after_terminal_fails(self):
+        path = self.make_receipt("after-terminal.jsonl")
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        ledger = ReceiptLedger.__new__(ReceiptLedger)
+        ledger.path = path
+        ledger.run_id = "r"
+        ledger.seq = len(records)
+        ledger.head = records[-1]["record_hash"]
+        ledger.append("state_transition", {"from": "COMPLETED", "to": "FAILED"})
+        self.assertFalse(verify_receipts(path)["valid"])
+
+    def test_duplicate_terminal_fails(self):
+        path = self.make_receipt("duplicate-terminal.jsonl")
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        ledger = ReceiptLedger.__new__(ReceiptLedger)
+        ledger.path = path
+        ledger.run_id = "r"
+        ledger.seq = len(records)
+        ledger.head = records[-1]["record_hash"]
+        ledger.append("terminal_result", {"result": {"status": "FAILED"}})
+        self.assertFalse(verify_receipts(path)["valid"])
+
+    def test_completed_terminal_must_match_completion_verdict(self):
+        path = Path(self.temp.name) / "conflicting-terminal.jsonl"
+        ledger = ReceiptLedger(path, "r")
+        ledger.append("request_accepted", {"ok": True})
+        ledger.append("completion_verdict", {"completion": {"matched": False, "evidence": []}})
+        ledger.append("terminal_result", {"result": {"status": "COMPLETED", "completion": {"matched": True, "evidence": []}, "before_fingerprint": "a" * 64, "after_fingerprint": "b" * 64}})
+        self.assertFalse(verify_receipts(path)["valid"])
+
 
 class SurfaceTests(unittest.TestCase):
     def test_version_and_tools(self):
@@ -346,6 +546,23 @@ class SurfaceTests(unittest.TestCase):
         self.assertTrue(value["components"]["offline_verifier"]["ok"])
         self.assertGreater(value["components"]["offline_verifier"]["valid_records_checked"], 0)
         self.assertEqual(value["side_effect_actions"], 0)
+
+    def test_health_reports_unhealthy_when_receipt_store_fails(self):
+        with patch.object(ReceiptLedger, "append", side_effect=ReceiptWriteError("injected")):
+            value = check_health(self.temp_dir())
+        self.assertEqual(value["status"], "unhealthy")
+        self.assertFalse(value["components"]["receipt_store"]["ok"])
+
+    def test_unhealthy_cli_returns_nonzero(self):
+        with patch("aside_jav.cli.check_health", return_value={"status": "unhealthy"}):
+            with patch("builtins.print"):
+                exit_code = cli_main(["health"])
+        self.assertNotEqual(exit_code, 0)
+
+    def temp_dir(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return directory.name
 
     def test_cli_help_discovers_commands(self):
         completed = subprocess.run([sys.executable, "-m", "aside_jav.cli", "--help"], text=True, capture_output=True, check=False)

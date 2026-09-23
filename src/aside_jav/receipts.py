@@ -16,6 +16,26 @@ SCHEMA_VERSION = "1"
 _SECRET_KEYS = re.compile(r"(?:password|passwd|secret|token|cookie|authorization|private[_-]?key|cvc|cvv)", re.I)
 _CARD = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
 _BEARER = re.compile(r"(?i)bearer\s+[a-z0-9._~+/=-]{8,}")
+_HEX_DIGEST = re.compile(r"[0-9a-f]{64}")
+
+# These names are produced and subsequently verified by the harness.  Callers
+# must opt in to trusting them; untrusted request and observation dictionaries
+# are always scanned without this exemption.
+INTERNAL_HASH_FIELDS = frozenset(
+    {
+        "after_fingerprint",
+        "before_fingerprint",
+        "candidate_fingerprint",
+        "decision_fingerprint",
+        "fingerprint",
+        "input_fingerprint",
+        "intent_fingerprint",
+        "observation_fingerprint",
+        "receipt_head",
+        "request_fingerprint",
+        "source_fingerprint",
+    }
+)
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -26,36 +46,41 @@ def fingerprint(value: Any) -> str:
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
-def contains_secret(value: Any, *, trusted_handle: bool = False) -> bool:
+def contains_secret(value: Any, *, trusted_hash_fields: frozenset[str] = frozenset()) -> bool:
     if isinstance(value, dict):
         for key, item in value.items():
             key_text = str(key)
-            if _SECRET_KEYS.search(key_text) and not (trusted_handle and key_text.endswith("handle")):
+            if _SECRET_KEYS.search(key_text):
                 if item not in (None, "", False, [], {}):
                     return True
-            if contains_secret(item, trusted_handle=trusted_handle or key_text in {"secret_handles", "handle"}):
+            if key_text in trusted_hash_fields and isinstance(item, str) and _HEX_DIGEST.fullmatch(item):
+                continue
+            if contains_secret(item, trusted_hash_fields=trusted_hash_fields):
                 return True
         return False
     if isinstance(value, (list, tuple)):
-        return any(contains_secret(item, trusted_handle=trusted_handle) for item in value)
-    if isinstance(value, str) and not trusted_handle:
+        return any(contains_secret(item, trusted_hash_fields=trusted_hash_fields) for item in value)
+    if isinstance(value, str):
         return bool(_CARD.search(value) or _BEARER.search(value))
     return False
 
 
-def redact(value: Any) -> Any:
+def redact(value: Any, *, trusted_hash_fields: frozenset[str] = frozenset()) -> Any:
     if isinstance(value, dict):
         clean: dict[str, Any] = {}
         for key, item in value.items():
-            if _SECRET_KEYS.search(str(key)) and not str(key).endswith("handle"):
-                clean[str(key)] = "[REDACTED]"
+            key_text = str(key)
+            if _SECRET_KEYS.search(key_text) and not key_text.endswith("handle"):
+                clean[key_text] = "[REDACTED]"
+            elif key_text in trusted_hash_fields and isinstance(item, str) and _HEX_DIGEST.fullmatch(item):
+                clean[key_text] = item
             else:
-                clean[str(key)] = redact(item)
+                clean[key_text] = redact(item, trusted_hash_fields=trusted_hash_fields)
         return clean
     if isinstance(value, list):
-        return [redact(item) for item in value]
+        return [redact(item, trusted_hash_fields=trusted_hash_fields) for item in value]
     if isinstance(value, tuple):
-        return [redact(item) for item in value]
+        return [redact(item, trusted_hash_fields=trusted_hash_fields) for item in value]
     if isinstance(value, str):
         text = _CARD.sub("[REDACTED]", value)
         return _BEARER.sub("[REDACTED]", text)
@@ -81,8 +106,8 @@ class ReceiptLedger:
             raise FileExistsError(str(self.path))
 
     def append(self, event_type: str, payload: dict[str, Any]) -> str:
-        safe_payload = redact(payload)
-        if contains_secret(safe_payload):
+        safe_payload = redact(payload, trusted_hash_fields=INTERNAL_HASH_FIELDS)
+        if contains_secret(safe_payload, trusted_hash_fields=INTERNAL_HASH_FIELDS):
             raise ReceiptWriteError("payload failed secret boundary")
         record = {
             "schema_version": SCHEMA_VERSION,
@@ -120,6 +145,8 @@ def verify_receipts(path: str | os.PathLike[str]) -> dict[str, Any]:
     next_seq: dict[str, int] = {}
     events: dict[str, list[str]] = {}
     terminal_status: dict[str, str | None] = {}
+    terminal_result: dict[str, dict[str, Any]] = {}
+    completion_verdict: dict[str, dict[str, Any]] = {}
     records = 0
     final_head: str | None = None
     try:
@@ -130,10 +157,12 @@ def verify_receipts(path: str | os.PathLike[str]) -> dict[str, Any]:
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     return _invalid(line_number, records=records, runs=len(events), head=final_head)
                 required = {"schema_version", "run_id", "seq", "event_type", "recorded_at", "payload", "prev_hash", "record_hash"}
-                if set(record) != required or contains_secret(record.get("payload")):
-                    code = "AJV_E_SECRET_DETECTED" if contains_secret(record.get("payload")) else "AJV_E_RECEIPT_CHAIN"
+                if set(record) != required or contains_secret(record.get("payload"), trusted_hash_fields=INTERNAL_HASH_FIELDS):
+                    code = "AJV_E_SECRET_DETECTED" if contains_secret(record.get("payload"), trusted_hash_fields=INTERNAL_HASH_FIELDS) else "AJV_E_RECEIPT_CHAIN"
                     return _invalid(line_number, code, records, len(events), final_head)
                 run_id = record["run_id"]
+                if run_id in terminal_result:
+                    return _invalid(line_number, records=records, runs=len(events), head=final_head)
                 expected_previous = previous.get(run_id, GENESIS)
                 expected_seq = next_seq.get(run_id, 0)
                 supplied_hash = record["record_hash"]
@@ -144,17 +173,36 @@ def verify_receipts(path: str | os.PathLike[str]) -> dict[str, Any]:
                 previous[run_id] = supplied_hash
                 next_seq[run_id] = expected_seq + 1
                 events.setdefault(run_id, []).append(record["event_type"])
+                if record["event_type"] == "completion_verdict":
+                    completion = record.get("payload", {}).get("completion")
+                    if not isinstance(completion, dict):
+                        return _invalid(line_number, records=records, runs=len(events), head=final_head)
+                    completion_verdict[run_id] = completion
                 if record["event_type"] == "terminal_result":
                     result = record.get("payload", {}).get("result", {})
-                    terminal_status[run_id] = result.get("status") if isinstance(result, dict) else None
+                    if not isinstance(result, dict) or not isinstance(result.get("status"), str):
+                        return _invalid(line_number, records=records, runs=len(events), head=final_head)
+                    terminal_result[run_id] = result
+                    terminal_status[run_id] = result["status"]
                 final_head = supplied_hash
                 records += 1
     except OSError:
         return _invalid(1, records=records, runs=len(events), head=final_head)
 
     for run_id, run_events in events.items():
-        if not run_events or run_events[0] not in {"request_accepted", "request_rejected"} or "terminal_result" not in run_events:
+        if not run_events or run_events[0] not in {"request_accepted", "request_rejected"} or run_events.count("terminal_result") != 1 or run_events[-1] != "terminal_result":
             return _invalid(None, records=records, runs=len(events), head=final_head)
+        result = terminal_result[run_id]
+        verdict = completion_verdict.get(run_id)
+        if verdict is not None and result.get("completion") != verdict:
+            return _invalid(None, records=records, runs=len(events), head=final_head)
+        if terminal_status[run_id] in {"COMPLETED", "ALREADY_COMPLETE"}:
+            if verdict is None or verdict.get("matched") is not True or not isinstance(result.get("before_fingerprint"), str):
+                return _invalid(None, records=records, runs=len(events), head=final_head)
+            if terminal_status[run_id] == "COMPLETED" and not isinstance(result.get("after_fingerprint"), str):
+                return _invalid(None, records=records, runs=len(events), head=final_head)
+            if terminal_status[run_id] == "ALREADY_COMPLETE" and result.get("after_fingerprint") is not None:
+                return _invalid(None, records=records, runs=len(events), head=final_head)
         if "action_attempted" in run_events:
             if "intent_durable" not in run_events or run_events.index("intent_durable") > run_events.index("action_attempted"):
                 return _invalid(None, records=records, runs=len(events), head=final_head)
