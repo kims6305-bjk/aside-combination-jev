@@ -19,3 +19,13 @@ jobs:
       - run: python -m build
       - run: python scripts/validate_skill.py
       - run: python scripts/smoke_install.py
+  live-browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e . playwright
+      - run: python -m playwright install --with-deps chromium
+      - run: python examples/playwright_live.py

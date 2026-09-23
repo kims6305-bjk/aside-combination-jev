@@ -70,6 +70,18 @@ Receipt records use UTF-8 JSON with sorted keys, no insignificant whitespace, pr
 
 Verification proves consistency of the recorded bytes and enforced event ordering. It does not prove that an adapter observed the external world correctly.
 
+## Real browser example
+
+`examples/playwright_live.py` drives headless Chromium through the harness against a page served on `127.0.0.1`. It uses no account and no external network. It checks four cases against the page itself, not against what the harness reports: a reversible click completes, a dry run leaves the page unchanged, a sensitive submit stops at `NEEDS_HUMAN` without clicking, and a card-like number in the page is rejected before any action.
+
+```sh
+python -m pip install playwright
+python -m playwright install chromium
+python examples/playwright_live.py   # prints LIVE PASS 4/4
+```
+
+The judgment adapter in the example is a deterministic rule, not a model.
+
 ## Security model and limits
 
 - The default state has no adapters and cannot perform actions.

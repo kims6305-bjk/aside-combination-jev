@@ -1,7 +1,7 @@
 ---
 name: aside-combination-jev
 description: Run or review policy-gated browser tasks with explicit adapters, exact completion checks, and offline-verifiable receipts.
-version: 0.1.0
+version: 0.1.1
 license: MIT
 metadata:
   hermes:
